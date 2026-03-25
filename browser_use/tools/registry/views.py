@@ -1,7 +1,7 @@
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from browser_use.browser import BrowserSession
 from browser_use.filesystem.file_system import FileSystem
@@ -64,6 +64,89 @@ class ActionModel(BaseModel):
 	# done = param_model = None
 	#
 	model_config = ConfigDict(arbitrary_types_allowed=True, extra='forbid')
+
+	@model_validator(mode='before')
+	@classmethod
+	def _fix_flattened_action_params(cls, v: object) -> object:
+		"""Recover when LLMs (e.g. Gemini Flash) flatten nested action params.
+
+		Handles two patterns:
+		1. Key=value style leaked params:
+		   {"click": "coordinate_x=330", "coordinate_y=309": null}
+		   → {"click": {"coordinate_x": 330, "coordinate_y": 309}}
+
+		2. Extra keys at the outer level that belong inside the action params:
+		   {"done": "Task complete", "success": true}
+		   → {"done": {"text": "Task complete", "success": true}}
+		"""
+		if not isinstance(v, dict):
+			return v
+
+		# Get valid field names for this specific (dynamically created) model
+		valid_fields: set[str] = set(cls.model_fields.keys()) if hasattr(cls, 'model_fields') else set()
+
+		# --- Pass 1: handle "key=value" style leaked params ---
+		leaked: dict[str, Any] = {}
+		normal: dict[str, Any] = {}
+		for key, val in v.items():
+			if '=' in str(key):
+				param_name, _, raw = str(key).partition('=')
+				try:
+					leaked[param_name] = int(raw) if raw.lstrip('-').isdigit() else raw
+				except (ValueError, TypeError):
+					leaked[param_name] = raw
+			else:
+				normal[key] = val
+
+		if leaked:
+			result: dict[str, Any] = {}
+			for action_key, action_value in normal.items():
+				if isinstance(action_value, str) and '=' in action_value:
+					param_name, _, raw = action_value.partition('=')
+					try:
+						action_dict: dict[str, Any] = {param_name: int(raw) if raw.lstrip('-').isdigit() else raw}
+					except (ValueError, TypeError):
+						action_dict = {param_name: raw}
+					action_dict.update(leaked)
+					result[action_key] = action_dict
+				elif isinstance(action_value, dict):
+					merged = dict(action_value)
+					merged.update(leaked)
+					result[action_key] = merged
+				else:
+					result[action_key] = action_value
+			return result
+
+		# --- Pass 2: handle extra non-action keys leaked into the outer dict ---
+		# e.g. {"done": "text", "success": True} → {"done": {"text": "text", "success": True}}
+		if valid_fields:
+			action_keys = [k for k in v if k in valid_fields]
+			extra_keys = [k for k in v if k not in valid_fields]
+			if len(action_keys) == 1 and extra_keys:
+				action_key = action_keys[0]
+				action_value = v[action_key]
+				extra = {k: v[k] for k in extra_keys}
+				if isinstance(action_value, dict):
+					merged_val = dict(action_value)
+					merged_val.update(extra)
+					return {action_key: merged_val}
+				elif isinstance(action_value, str):
+					# Convert the string via the param model's own coercer to get a base dict,
+					# then merge the extra keys (e.g. "success: True" from DoneAction).
+					field_info = cls.model_fields.get(action_key)
+					param_type = field_info.annotation if field_info else None
+					if param_type is not None and isinstance(param_type, type) and issubclass(param_type, BaseModel):
+						try:
+							converted = param_type.model_validate(action_value)
+							base_dict = converted.model_dump()
+							base_dict.update(extra)
+							return {action_key: base_dict}
+						except Exception:
+							pass
+					# Fallback: keep string as-is, drop unrecognised extras
+					return {action_key: action_value}
+
+		return v
 
 	def get_index(self) -> int | None:
 		"""Get the index of the action"""

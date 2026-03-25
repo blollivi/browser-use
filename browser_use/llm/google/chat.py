@@ -562,6 +562,30 @@ class ChatGoogle(BaseChatModel):
 			schema = resolve_refs(schema)
 
 		# Remove unsupported properties
+		# Gemini's Schema model only supports a subset of OpenAPI 3.0 fields and uses extra='forbid',
+		# so any JSON Schema keywords it doesn't recognize (like exclusiveMinimum/Maximum, numeric
+		# constraints, pattern, etc.) must be stripped before passing to the API.
+		_GEMINI_UNSUPPORTED_KEYS = frozenset([
+			'additionalProperties',
+			'default',
+			'exclusiveMinimum',
+			'exclusiveMaximum',
+			'minimum',
+			'maximum',
+			'minLength',
+			'maxLength',
+			'multipleOf',
+			'pattern',
+			'const',
+			'allOf',
+			'anyOf',
+			'oneOf',
+			'not',
+			'if',
+			'then',
+			'else',
+		])
+
 		def clean_schema(obj: Any, parent_key: str | None = None) -> Any:
 			if isinstance(obj, dict):
 				# Remove unsupported properties
@@ -570,7 +594,7 @@ class ChatGoogle(BaseChatModel):
 					# Only strip 'title' when it's a JSON Schema metadata field (not inside 'properties')
 					# 'title' as a metadata field appears at schema level, not as a property name
 					is_metadata_title = key == 'title' and parent_key != 'properties'
-					if key not in ['additionalProperties', 'default'] and not is_metadata_title:
+					if key not in _GEMINI_UNSUPPORTED_KEYS and not is_metadata_title:
 						cleaned_value = clean_schema(value, parent_key=key)
 						# Handle empty object properties - Gemini doesn't allow empty OBJECT types
 						if (

@@ -6,8 +6,10 @@ to use coordinate-based clicking, while other models only get index-based clicki
 
 import pytest
 
+from browser_use.agent.service import Agent
 from browser_use.tools.service import Tools
 from browser_use.tools.views import ClickElementAction, ClickElementActionIndexOnly
+from tests.ci.conftest import create_mock_llm
 
 
 class TestCoordinateClickingTools:
@@ -161,6 +163,30 @@ class TestCoordinateClickingWithPassedTools:
 		tools.set_coordinate_clicking(True)
 
 		click_action = tools.registry.registry.actions.get('click')
+		assert click_action is not None
+		assert click_action.param_model == ClickElementAction
+
+	def test_agent_can_be_restricted_to_screenshot_and_coordinate_click_only(self):
+		"""Agent can keep only screenshot and coordinate-capable click actions."""
+		tools = Tools()
+		tools.set_coordinate_clicking(True)
+
+		allowed_actions = {'click', 'screenshot', 'done'}
+		for action_name in list(tools.registry.registry.actions):
+			if action_name not in allowed_actions:
+				tools.exclude_action(action_name)
+
+		mock_llm = create_mock_llm(actions=['{"action": [{"done": {"text": "test", "success": true}}]}'])
+		agent = Agent(
+			task='test',
+			llm=mock_llm,
+			tools=tools,
+			use_vision='auto',
+		)
+
+		assert set(agent.tools.registry.registry.actions) == allowed_actions
+
+		click_action = agent.tools.registry.registry.actions.get('click')
 		assert click_action is not None
 		assert click_action.param_model == ClickElementAction
 
