@@ -35,9 +35,11 @@ from browser_use.llm.base import BaseChatModel
 from browser_use.llm.messages import SystemMessage, UserMessage
 from browser_use.observability import observe_debug
 from browser_use.tools.registry.service import Registry
+from browser_use.tools.registry.views import RegisteredAction
 from browser_use.tools.utils import get_click_description
 from browser_use.tools.views import (
 	ClickElementAction,
+	ClickElementActionCoordinateOnly,
 	ClickElementActionIndexOnly,
 	CloseTabAction,
 	DoneAction,
@@ -45,11 +47,13 @@ from browser_use.tools.views import (
 	FindElementsAction,
 	GetDropdownOptionsAction,
 	InputTextAction,
+	InputTextActionCoordinateOnly,
 	NavigateAction,
 	NoParamsAction,
 	SaveAsPdfAction,
 	ScreenshotAction,
 	ScrollAction,
+	ScrollActionCoordinateOnly,
 	SearchAction,
 	SearchPageAction,
 	SelectDropdownOptionAction,
@@ -360,6 +364,9 @@ class Tools(Generic[Context]):
 		self.display_files_in_done_text = display_files_in_done_text
 		self._output_model: type[BaseModel] | None = output_model
 		self._coordinate_clicking_enabled: bool = False
+		self._vision_grounding_mode_enabled: bool = False
+		self._vision_grounding_temporarily_excluded_actions: set[str] = set()
+		self._original_registered_actions: dict[str, RegisteredAction] = {}
 
 		"""Register all default browser actions"""
 
@@ -520,12 +527,27 @@ class Tools(Generic[Context]):
 
 		# Helper function for coordinate conversion
 		def _convert_llm_coordinates_to_viewport(llm_x: int, llm_y: int, browser_session: BrowserSession) -> tuple[int, int]:
-			"""Convert coordinates from LLM screenshot size to original viewport size."""
+			"""Convert coordinates from LLM-provided space to original viewport pixels.
+
+			In vision grounding mode the agent works in a normalized 0–1000 coordinate space
+			(matching the grounding model's output) and coordinates are scaled to viewport pixels here.
+			Otherwise, when llm_screenshot_size is set, converts from the resized screenshot pixel space.
+			"""
+			# Vision grounding mode: 0-1000 normalized → viewport pixels
+			if self._vision_grounding_mode_enabled and browser_session._original_viewport_size:
+				viewport_width, viewport_height = browser_session._original_viewport_size
+				actual_x = round(llm_x * viewport_width / 1000)
+				actual_y = round(llm_y * viewport_height / 1000)
+				logger.info(
+					f'🔄 Grounding coords: ({llm_x}, {llm_y}) 0-1000 '
+					f'→ Viewport ({actual_x}, {actual_y}) @ {viewport_width}x{viewport_height}'
+				)
+				return actual_x, actual_y
+			# Screenshot resize mode: LLM screenshot pixel space → viewport pixels
 			if browser_session.llm_screenshot_size and browser_session._original_viewport_size:
 				original_width, original_height = browser_session._original_viewport_size
 				llm_width, llm_height = browser_session.llm_screenshot_size
 
-				# Convert coordinates using fractions
 				actual_x = int((llm_x / llm_width) * original_width)
 				actual_y = int((llm_y / llm_height) * original_height)
 
@@ -564,7 +586,10 @@ class Tools(Generic[Context]):
 				pass
 			return ''
 
-		async def _click_by_coordinate(params: ClickElementAction, browser_session: BrowserSession) -> ActionResult:
+		async def _click_by_coordinate(
+			params: ClickElementAction | ClickElementActionCoordinateOnly,
+			browser_session: BrowserSession,
+		) -> ActionResult:
 			# Ensure coordinates are provided (type safety)
 			if params.coordinate_x is None or params.coordinate_y is None:
 				return ActionResult(error='Both coordinate_x and coordinate_y must be provided')
@@ -575,8 +600,9 @@ class Tools(Generic[Context]):
 					params.coordinate_x, params.coordinate_y, browser_session
 				)
 
-				# Capture tab IDs before click to detect new tabs
+				# Capture tab IDs and current URL before click to detect navigation
 				tabs_before = {t.target_id for t in await browser_session.get_tabs()}
+				url_before = await browser_session.get_current_page_url()
 
 				# Highlight the coordinate being clicked (truly non-blocking)
 				asyncio.create_task(browser_session.highlight_coordinate_click(actual_x, actual_y))
@@ -594,7 +620,13 @@ class Tools(Generic[Context]):
 					error_msg = click_metadata['validation_error']
 					return ActionResult(error=error_msg)
 
+				# Brief wait to allow same-tab navigation to start and update target URL
+				await asyncio.sleep(0.2)
+				url_after = await browser_session.get_current_page_url()
+
 				memory = f'Clicked on coordinate {params.coordinate_x}, {params.coordinate_y}'
+				if url_after and url_before and url_after != url_before:
+					memory += f'. Navigated to: {url_after}'
 				memory += await _detect_new_tab_opened(browser_session, tabs_before)
 				logger.info(f'🖱️ {memory}')
 
@@ -679,7 +711,7 @@ class Tools(Generic[Context]):
 		self._register_click_action()
 
 		@self.registry.action(
-			'Input text into element by index.',
+			'Input text into element by index or coordinates. Use coordinates when DOM indices are unavailable.',
 			param_model=InputTextAction,
 		)
 		async def input(
@@ -688,12 +720,37 @@ class Tools(Generic[Context]):
 			has_sensitive_data: bool = False,
 			sensitive_data: dict[str, str | dict[str, str]] | None = None,
 		):
-			# Look up the node from the selector map
-			node = await browser_session.get_element_by_index(params.index)
-			if node is None:
-				msg = f'Element index {params.index} not available - page may have changed. Try refreshing browser state.'
-				logger.warning(f'⚠️ {msg}')
-				return ActionResult(extracted_content=msg)
+			input_metadata: dict[str, object] | None = None
+			index = getattr(params, 'index', None)
+			coordinate_x = getattr(params, 'coordinate_x', None)
+			coordinate_y = getattr(params, 'coordinate_y', None)
+			if index is not None:
+				node = await browser_session.get_element_by_index(index)
+				if node is None:
+					msg = f'Element index {index} not available - page may have changed. Try refreshing browser state.'
+					logger.warning(f'⚠️ {msg}')
+					return ActionResult(extracted_content=msg)
+				target_description = f'element {index}'
+			else:
+				assert coordinate_x is not None and coordinate_y is not None
+				actual_x, actual_y = _convert_llm_coordinates_to_viewport(
+					coordinate_x, coordinate_y, browser_session
+				)
+				node = await browser_session.get_dom_element_at_coordinates(actual_x, actual_y)
+				if node is None:
+					return ActionResult(
+						error=(
+							f'No DOM element was found at coordinates ({coordinate_x}, {coordinate_y}). '
+							'Try a different grounded element or refresh the state.'
+						)
+					)
+				create_task_with_error_handling(
+					browser_session.highlight_coordinate_click(actual_x, actual_y),
+					name='highlight_type_coordinate',
+					suppress_exceptions=True,
+				)
+				input_metadata = {'input_x': actual_x, 'input_y': actual_y}
+				target_description = f'coordinates {coordinate_x}, {coordinate_y}'
 
 			# Highlight the element being typed into (truly non-blocking)
 			create_task_with_error_handling(
@@ -717,18 +774,20 @@ class Tools(Generic[Context]):
 					)
 				)
 				await event
-				input_metadata = await event.event_result(raise_if_any=True, raise_if_none=False)
+				event_metadata = await event.event_result(raise_if_any=True, raise_if_none=False)
+				if isinstance(event_metadata, dict):
+					input_metadata = {**input_metadata, **event_metadata} if input_metadata else event_metadata
 
 				# Create message with sensitive data handling
 				if has_sensitive_data:
 					if sensitive_key_name:
-						msg = f'Typed {sensitive_key_name}'
+						msg = f'Typed {sensitive_key_name} into {target_description}'
 						log_msg = f'Typed <{sensitive_key_name}>'
 					else:
-						msg = 'Typed sensitive data'
+						msg = f'Typed sensitive data into {target_description}'
 						log_msg = 'Typed <sensitive>'
 				else:
-					msg = f"Typed '{params.text}'"
+					msg = f"Typed '{params.text}' into {target_description}"
 					log_msg = f"Typed '{params.text}'"
 
 				logger.debug(log_msg)
@@ -761,8 +820,12 @@ class Tools(Generic[Context]):
 			except Exception as e:
 				# Log the full error for debugging
 				logger.error(f'Failed to dispatch TypeTextEvent: {type(e).__name__}: {e}')
-				error_msg = f'Failed to type text into element {params.index}: {e}'
+				target = index if index is not None else f'({coordinate_x}, {coordinate_y})'
+				error_msg = f'Failed to type text into {target}: {e}'
 				return ActionResult(error=error_msg)
+
+		self._input_handler = input
+		self._original_registered_actions['input'] = self.registry.registry.actions['input']
 
 		@self.registry.action(
 			'',
@@ -891,6 +954,9 @@ class Tools(Generic[Context]):
 			except Exception as e:
 				logger.error(f'Failed to upload file: {e}')
 				raise BrowserError(f'Failed to upload file: {e}')
+
+		self._upload_file_handler = upload_file
+		self._original_registered_actions['upload_file'] = self.registry.registry.actions['upload_file']
 
 		# Tab Management Actions
 
@@ -1270,15 +1336,16 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				# Look up the node from the selector map if index is provided
 				# Special case: index 0 means scroll the whole page (root/body element)
 				node = None
-				if params.index is not None and params.index != 0:
-					node = await browser_session.get_element_by_index(params.index)
+				index = getattr(params, 'index', None)
+				if index is not None and index != 0:
+					node = await browser_session.get_element_by_index(index)
 					if node is None:
 						# Element does not exist
-						msg = f'Element index {params.index} not found in browser state'
+						msg = f'Element index {index} not found in browser state'
 						return ActionResult(error=msg)
 
 				direction = 'down' if params.down else 'up'
-				target = f'element {params.index}' if params.index is not None and params.index != 0 else ''
+				target = f'element {index}' if index is not None and index != 0 else ''
 
 				# Get actual viewport height for more accurate scrolling
 				try:
@@ -1365,6 +1432,9 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				logger.error(f'Failed to dispatch ScrollEvent: {type(e).__name__}: {e}')
 				error_msg = 'Failed to execute scroll action.'
 				return ActionResult(error=error_msg)
+
+		self._scroll_handler = scroll
+		self._original_registered_actions['scroll'] = self.registry.registry.actions['scroll']
 
 		@self.registry.action(
 			'',
@@ -1564,6 +1634,9 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				include_extracted_content_only_once=True,
 			)
 
+		self._dropdown_options_handler = dropdown_options
+		self._original_registered_actions['dropdown_options'] = self.registry.registry.actions['dropdown_options']
+
 		@self.registry.action(
 			'Set the option of a <select> element.',
 			param_model=SelectDropdownOptionAction,
@@ -1604,10 +1677,12 @@ You will be given a query and the markdown of a webpage that has been filtered t
 						long_term_memory=selection_data['long_term_memory'],
 						include_extracted_content_only_once=True,
 					)
-				else:
-					# Fallback to regular error
-					error_msg = selection_data.get('error', f'Failed to select option: {params.text}')
-					return ActionResult(error=error_msg)
+				# Fallback to regular error
+				error_msg = selection_data.get('error', f'Failed to select option: {params.text}')
+				return ActionResult(error=error_msg)
+
+		self._select_dropdown_handler = select_dropdown
+		self._original_registered_actions['select_dropdown'] = self.registry.registry.actions['select_dropdown']
 
 		# File System Actions
 
@@ -1980,8 +2055,16 @@ Validated Code (after quote fixing):
 		# Remove existing click action if present
 		if 'click' in self.registry.registry.actions:
 			del self.registry.registry.actions['click']
+		self._allow_action('click')
 
-		if self._coordinate_clicking_enabled:
+		if self._vision_grounding_mode_enabled:
+			@self.registry.action(
+				'Click an interactive element by coordinates from the vision-grounded browser_state and screenshot.',
+				param_model=ClickElementActionCoordinateOnly,
+			)
+			async def click(params: ClickElementActionCoordinateOnly, browser_session: BrowserSession):
+				return await self._click_by_coordinate(params, browser_session)
+		elif self._coordinate_clicking_enabled:
 			# Register click action WITH coordinate support
 			@self.registry.action(
 				'Click element by index or coordinates. Use coordinates only if the index is not available. Either provide coordinates or index.',
@@ -2007,6 +2090,73 @@ Validated Code (after quote fixing):
 			async def click(params: ClickElementActionIndexOnly, browser_session: BrowserSession):
 				return await self._click_by_index(params, browser_session)
 
+	def _allow_action(self, action_name: str) -> None:
+		if action_name in self.registry.exclude_actions:
+			self.registry.exclude_actions.remove(action_name)
+
+	def _register_input_action(self) -> None:
+		if 'input' in self.registry.registry.actions:
+			del self.registry.registry.actions['input']
+		self._allow_action('input')
+		original = self._original_registered_actions['input']
+
+		if self._vision_grounding_mode_enabled:
+			description = 'Input text into an element by coordinates from the vision-grounded browser_state and screenshot.'
+			param_model = InputTextActionCoordinateOnly
+		else:
+			description = 'Input text into element by index or coordinates. Use coordinates when DOM indices are unavailable.'
+			param_model = InputTextAction
+
+		self.registry.registry.actions['input'] = RegisteredAction(
+			name='input',
+			description=description,
+			function=original.function,
+			param_model=param_model,
+			terminates_sequence=original.terminates_sequence,
+			domains=original.domains,
+		)
+
+	def _register_scroll_action(self) -> None:
+		if 'scroll' in self.registry.registry.actions:
+			del self.registry.registry.actions['scroll']
+		self._allow_action('scroll')
+		original = self._original_registered_actions['scroll']
+
+		description = (
+			'Scroll by pages. REQUIRED: down=True/False (True=scroll down, False=scroll up, default=True). '
+			'Optional: pages=0.5-10.0 (default 1.0). High pages (10) reaches bottom. '
+			'Multi-page scrolls sequentially. Viewport-based height, fallback 1000px/page.'
+			if self._vision_grounding_mode_enabled
+			else 'Scroll by pages. REQUIRED: down=True/False (True=scroll down, False=scroll up, default=True). Optional: pages=0.5-10.0 (default 1.0). Use index for scroll elements (dropdowns/custom UI). High pages (10) reaches bottom. Multi-page scrolls sequentially. Viewport-based height, fallback 1000px/page.'
+		)
+		param_model = ScrollActionCoordinateOnly if self._vision_grounding_mode_enabled else ScrollAction
+		self.registry.registry.actions['scroll'] = RegisteredAction(
+			name='scroll',
+			description=description,
+			function=original.function,
+			param_model=param_model,
+			terminates_sequence=original.terminates_sequence,
+			domains=original.domains,
+		)
+
+	def _register_upload_file_action(self) -> None:
+		if 'upload_file' in self.registry.registry.actions:
+			del self.registry.registry.actions['upload_file']
+		self._allow_action('upload_file')
+		self.registry.registry.actions['upload_file'] = self._original_registered_actions['upload_file']
+
+	def _register_dropdown_options_action(self) -> None:
+		if 'dropdown_options' in self.registry.registry.actions:
+			del self.registry.registry.actions['dropdown_options']
+		self._allow_action('dropdown_options')
+		self.registry.registry.actions['dropdown_options'] = self._original_registered_actions['dropdown_options']
+
+	def _register_select_dropdown_action(self) -> None:
+		if 'select_dropdown' in self.registry.registry.actions:
+			del self.registry.registry.actions['select_dropdown']
+		self._allow_action('select_dropdown')
+		self.registry.registry.actions['select_dropdown'] = self._original_registered_actions['select_dropdown']
+
 	def set_coordinate_clicking(self, enabled: bool) -> None:
 		"""Enable or disable coordinate-based clicking.
 
@@ -2028,6 +2178,30 @@ Validated Code (after quote fixing):
 		self._coordinate_clicking_enabled = enabled
 		self._register_click_action()
 		logger.debug(f'Coordinate clicking {"enabled" if enabled else "disabled"}')
+
+	def set_vision_grounding_mode(self, enabled: bool) -> None:
+		if enabled == self._vision_grounding_mode_enabled:
+			return
+
+		self._vision_grounding_mode_enabled = enabled
+
+		if enabled:
+			for action_name in ('upload_file', 'dropdown_options', 'select_dropdown'):
+				if action_name not in self.registry.exclude_actions:
+					self.exclude_action(action_name)
+					self._vision_grounding_temporarily_excluded_actions.add(action_name)
+		else:
+			for action_name in list(self._vision_grounding_temporarily_excluded_actions):
+				self._allow_action(action_name)
+			self._vision_grounding_temporarily_excluded_actions.clear()
+			self._register_upload_file_action()
+			self._register_dropdown_options_action()
+			self._register_select_dropdown_action()
+
+		self._register_click_action()
+		self._register_input_action()
+		self._register_scroll_action()
+		logger.debug(f'Vision grounding mode {"enabled" if enabled else "disabled"}')
 
 	# Act --------------------------------------------------------------------
 	@observe_debug(ignore_input=True, ignore_output=True, name='act')

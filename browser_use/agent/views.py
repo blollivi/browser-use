@@ -59,6 +59,7 @@ class AgentSettings(BaseModel):
 	"""Configuration options for the Agent"""
 
 	use_vision: bool | Literal['auto'] = True
+	use_vision_grounding: bool | Literal['fallback'] = False
 	vision_detail_level: Literal['auto', 'low', 'high'] = 'auto'
 	save_conversation_path: str | Path | None = None
 	save_conversation_path_encoding: str | None = 'utf-8'
@@ -79,6 +80,7 @@ class AgentSettings(BaseModel):
 	planning_exploration_limit: int = 5  # steps without a plan before nudge; 0 = disabled
 
 	page_extraction_llm: BaseChatModel | None = None
+	vision_grounding_llm: BaseChatModel | None = None
 	calculate_cost: bool = False
 	include_tool_call_examples: bool = False
 	llm_timeout: int = 60  # Timeout in seconds for LLM calls (auto-detected: 30s for gemini, 90s for o3, 60s default)
