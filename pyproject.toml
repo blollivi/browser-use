@@ -100,6 +100,7 @@ browseruse = "browser_use.skill_cli.main:main"  # Alias for browser-use
 bu = "browser_use.skill_cli.main:main"  # Alias for browser-use
 browser = "browser_use.skill_cli.main:main"  # Alias for browser-use
 browser-use-tui = "browser_use.cli:main"  # Legacy TUI interface
+browser-use-vision-test = "browser_use.vision_grounding.cli:main"
 
 [build-system]
 requires = ["hatchling"]

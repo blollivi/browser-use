@@ -34,6 +34,7 @@ class SystemPrompt:
 		flash_mode: bool = False,
 		is_anthropic: bool = False,
 		is_browser_use_model: bool = False,
+		use_vision_grounding: bool = False,
 		model_name: str | None = None,
 	):
 		self.max_actions_per_step = max_actions_per_step
@@ -41,6 +42,7 @@ class SystemPrompt:
 		self.flash_mode = flash_mode
 		self.is_anthropic = is_anthropic
 		self.is_browser_use_model = is_browser_use_model
+		self.use_vision_grounding = use_vision_grounding
 		self.model_name = model_name
 		# Check if this is an Anthropic 4.5 model that needs longer prompts for caching
 		self.is_anthropic_4_5 = _is_anthropic_4_5_model(model_name)
@@ -59,9 +61,11 @@ class SystemPrompt:
 	def _load_prompt_template(self) -> None:
 		"""Load the prompt template from the markdown file."""
 		try:
+			if self.use_vision_grounding:
+				template_filename = 'system_prompt_vision_grounding.md'
 			# Choose the appropriate template based on model type and mode
 			# Browser-use models use simplified prompts optimized for fine-tuned models
-			if self.is_browser_use_model:
+			elif self.is_browser_use_model:
 				if self.flash_mode:
 					template_filename = 'system_prompt_browser_use_flash.md'
 				elif self.use_thinking:
@@ -221,26 +225,30 @@ class AgentMessagePrompt:
 
 	@observe_debug(ignore_input=True, ignore_output=True, name='_get_browser_state_description')
 	def _get_browser_state_description(self) -> str:
-		# Extract page statistics first
-		page_stats = self._extract_page_statistics()
+		vision_grounding_active = bool(self.browser_state.vision_grounding_active)
+		if vision_grounding_active:
+			stats_text = '<page_stats>Vision grounding active; DOM statistics omitted.</page_stats>\n'
+		else:
+			page_stats = self._extract_page_statistics()
 
-		# Format statistics
-		stats_text = '<page_stats>'
-		if page_stats['total_elements'] < 10:
-			stats_text += 'Page appears empty (SPA not loaded?) - '
-		# Skeleton screen: many elements but almost no text = loading placeholders
-		elif page_stats['total_elements'] > 20 and page_stats['text_chars'] < page_stats['total_elements'] * 5:
-			stats_text += 'Page appears to show skeleton/placeholder content (still loading?) - '
-		stats_text += f'{page_stats["links"]} links, {page_stats["interactive_elements"]} interactive, '
-		stats_text += f'{page_stats["iframes"]} iframes'
-		if page_stats['shadow_open'] > 0 or page_stats['shadow_closed'] > 0:
-			stats_text += f', {page_stats["shadow_open"]} shadow(open), {page_stats["shadow_closed"]} shadow(closed)'
-		if page_stats['images'] > 0:
-			stats_text += f', {page_stats["images"]} images'
-		stats_text += f', {page_stats["total_elements"]} total elements'
-		stats_text += '</page_stats>\n'
+			stats_text = '<page_stats>'
+			if page_stats['total_elements'] < 10:
+				stats_text += 'Page appears empty (SPA not loaded?) - '
+			elif page_stats['total_elements'] > 20 and page_stats['text_chars'] < page_stats['total_elements'] * 5:
+				stats_text += 'Page appears to show skeleton/placeholder content (still loading?) - '
+			stats_text += f'{page_stats["links"]} links, {page_stats["interactive_elements"]} interactive, '
+			stats_text += f'{page_stats["iframes"]} iframes'
+			if page_stats['shadow_open'] > 0 or page_stats['shadow_closed'] > 0:
+				stats_text += f', {page_stats["shadow_open"]} shadow(open), {page_stats["shadow_closed"]} shadow(closed)'
+			if page_stats['images'] > 0:
+				stats_text += f', {page_stats["images"]} images'
+			stats_text += f', {page_stats["total_elements"]} total elements'
+			stats_text += '</page_stats>\n'
 
-		elements_text = self.browser_state.dom_state.llm_representation(include_attributes=self.include_attributes)
+		if self.browser_state.vision_grounding_active and self.browser_state.vision_grounding_elements_description:
+			elements_text = self.browser_state.vision_grounding_elements_description
+		else:
+			elements_text = self.browser_state.dom_state.llm_representation(include_attributes=self.include_attributes)
 
 		if len(elements_text) > self.max_clickable_elements_length:
 			elements_text = elements_text[: self.max_clickable_elements_length]

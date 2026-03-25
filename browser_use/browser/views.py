@@ -108,6 +108,10 @@ class BrowserStateSummary:
 	pending_network_requests: list[NetworkRequest] = field(default_factory=list)  # Currently loading network requests
 	pagination_buttons: list[PaginationButton] = field(default_factory=list)  # Detected pagination buttons
 	closed_popup_messages: list[str] = field(default_factory=list)  # Messages from auto-closed JavaScript dialogs
+	vision_grounding_active: bool = False
+	vision_grounding_elements_description: str | None = None
+	vision_grounding_instruction: str | None = None
+	vision_grounding_elements: list[Any] = field(default_factory=list, repr=False)
 
 
 @dataclass

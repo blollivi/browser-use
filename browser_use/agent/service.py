@@ -80,6 +80,7 @@ from browser_use.utils import (
 	time_execution_async,
 	time_execution_sync,
 )
+from browser_use.vision_grounding import VisionGroundingService
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +165,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		output_model_schema: type[AgentStructuredOutput] | None = None,
 		extraction_schema: dict | None = None,
 		use_vision: bool | Literal['auto'] = True,
+		use_vision_grounding: bool | Literal['fallback'] = False,
 		save_conversation_path: str | Path | None = None,
 		save_conversation_path_encoding: str | None = 'utf-8',
 		max_failures: int = 5,
@@ -178,6 +180,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		demo_mode: bool | None = None,
 		max_history_items: int | None = None,
 		page_extraction_llm: BaseChatModel | None = None,
+		vision_grounding_llm: BaseChatModel | None = None,
 		fallback_llm: BaseChatModel | None = None,
 		use_judge: bool = True,
 		ground_truth: str | None = None,
@@ -246,6 +249,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		if page_extraction_llm is None:
 			page_extraction_llm = llm
+		if vision_grounding_llm is None:
+			vision_grounding_llm = llm
 		if judge_llm is None:
 			judge_llm = llm
 		if available_file_paths is None:
@@ -324,6 +329,10 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		)
 		if supports_coordinate_clicking:
 			self.tools.set_coordinate_clicking(True)
+		if use_vision_grounding is not False:
+			self.tools.set_coordinate_clicking(True)
+		if use_vision_grounding is True:
+			self.tools.set_vision_grounding_mode(True)
 
 		# Handle skills vs skill_ids parameter (skills takes precedence)
 		if skills and skill_ids:
@@ -377,12 +386,16 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.sensitive_data = sensitive_data
 
 		self.sample_images = sample_images
+		self.vision_grounding_service = (
+			VisionGroundingService(vision_grounding_llm) if use_vision_grounding is not False else None
+		)
 
 		if isinstance(message_compaction, bool):
 			message_compaction = MessageCompactionSettings(enabled=message_compaction)
 
 		self.settings = AgentSettings(
 			use_vision=use_vision,
+			use_vision_grounding=use_vision_grounding,
 			vision_detail_level=vision_detail_level,
 			save_conversation_path=save_conversation_path,
 			save_conversation_path_encoding=save_conversation_path_encoding,
@@ -396,6 +409,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			flash_mode=flash_mode,
 			max_history_items=max_history_items,
 			page_extraction_llm=page_extraction_llm,
+			vision_grounding_llm=vision_grounding_llm,
 			calculate_cost=calculate_cost,
 			include_tool_call_examples=include_tool_call_examples,
 			llm_timeout=llm_timeout,
@@ -416,6 +430,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.token_cost_service = TokenCost(include_cost=calculate_cost)
 		self.token_cost_service.register_llm(llm)
 		self.token_cost_service.register_llm(page_extraction_llm)
+		self.token_cost_service.register_llm(vision_grounding_llm)
 		self.token_cost_service.register_llm(judge_llm)
 		if self.settings.message_compaction and self.settings.message_compaction.compaction_llm:
 			self.token_cost_service.register_llm(self.settings.message_compaction.compaction_llm)
@@ -501,6 +516,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				flash_mode=self.settings.flash_mode,
 				is_anthropic=is_anthropic,
 				is_browser_use_model=is_browser_use_model,
+				use_vision_grounding=use_vision_grounding is True,
 				model_name=self.llm.model,
 			).get_system_message(),
 			file_system=self.file_system,
@@ -1073,6 +1089,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			include_screenshot=True,  # always capture even if use_vision=False so that cloud sync is useful (it's fast now anyway)
 			include_recent_events=self.include_recent_events,
 		)
+		await self._maybe_apply_vision_grounding(browser_state_summary)
 		if browser_state_summary.screenshot:
 			self.logger.debug(f'📸 Got browser state WITH screenshot, length: {len(browser_state_summary.screenshot)}')
 		else:
@@ -1117,7 +1134,11 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			model_output=self.state.last_model_output,
 			result=self.state.last_result,
 			step_info=step_info,
-			use_vision=self.settings.use_vision,
+			use_vision=(
+				True
+				if browser_state_summary.vision_grounding_active and self.settings.use_vision is not False
+				else self.settings.use_vision
+			),
 			page_filtered_actions=page_filtered_actions if page_filtered_actions else None,
 			sensitive_data=self.sensitive_data,
 			available_file_paths=self.available_file_paths,  # Always pass current available_file_paths
@@ -1134,6 +1155,54 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		await self._force_done_after_last_step(step_info)
 		await self._force_done_after_failure()
 		return browser_state_summary
+
+	async def _maybe_apply_vision_grounding(self, browser_state_summary: BrowserStateSummary) -> None:
+		if self.settings.use_vision_grounding == 'fallback':
+			self.tools.set_vision_grounding_mode(False)
+
+		if self.vision_grounding_service is None:
+			return
+		if not browser_state_summary.screenshot:
+			return
+
+		selector_map = browser_state_summary.dom_state.selector_map if browser_state_summary.dom_state else {}
+		should_ground = False
+		if self.settings.use_vision_grounding is True:
+			should_ground = True
+		elif self.settings.use_vision_grounding == 'fallback' and len(selector_map) == 0:
+			should_ground = True
+
+		if not should_ground:
+			return
+
+		try:
+			self.tools.set_vision_grounding_mode(True)
+			grounding_result = await self.vision_grounding_service.ground_elements(
+				browser_state_summary.screenshot,
+				task_context=self.task,
+			)
+			if not grounding_result.elements:
+				self.logger.warning('Vision grounding returned no elements; keeping DOM-based context')
+				return
+
+			browser_state_summary.screenshot = await self.vision_grounding_service.create_grounded_screenshot(
+				browser_state_summary.screenshot,
+				grounding_result,
+			)
+			browser_state_summary.vision_grounding_active = True
+			browser_state_summary.vision_grounding_elements = grounding_result.elements
+			browser_state_summary.vision_grounding_elements_description = self.vision_grounding_service.build_elements_description(
+				grounding_result,
+			)
+			browser_state_summary.vision_grounding_instruction = (
+				'Elements were grounded from the screenshot. The labels in the screenshot match the list below. '
+				'Use coordinate-based actions with the listed center coordinates. Do not rely on DOM indices for interaction in this step.'
+			)
+			self.logger.info(f'🧭 Vision grounding active with {len(grounding_result.elements)} elements')
+		except Exception as e:
+			if self.settings.use_vision_grounding == 'fallback':
+				self.tools.set_vision_grounding_mode(False)
+			self.logger.warning(f'Vision grounding failed; continuing with DOM-based context: {e}')
 
 	async def _maybe_compact_messages(self, step_info: AgentStepInfo | None = None) -> None:
 		"""Optionally compact message history to keep prompts small."""

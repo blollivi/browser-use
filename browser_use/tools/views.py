@@ -1,6 +1,6 @@
 from typing import Generic, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
 
@@ -61,6 +61,14 @@ class NavigateAction(BaseModel):
 	url: str
 	new_tab: bool = Field(default=False)
 
+	@model_validator(mode='before')
+	@classmethod
+	def coerce_string(cls, v: object) -> object:
+		"""Allow LLMs to pass a plain URL string instead of {"url": "..."}."""
+		if isinstance(v, str):
+			return {'url': v}
+		return v
+
 
 # Backward compatibility alias
 GoToUrlAction = NavigateAction
@@ -80,13 +88,73 @@ class ClickElementActionIndexOnly(BaseModel):
 	index: int = Field(ge=1, description='Element index from browser_state')
 
 
+class ClickElementActionCoordinateOnly(BaseModel):
+	model_config = ConfigDict(title='ClickElementAction')
+
+	coordinate_x: int = Field(description='Horizontal coordinate relative to viewport left edge')
+	coordinate_y: int = Field(description='Vertical coordinate relative to viewport top edge')
+
+	@model_validator(mode='before')
+	@classmethod
+	def coerce_list(cls, value: object) -> object:
+		"""Accept [x, y] list or 'x, y' string as {'coordinate_x': x, 'coordinate_y': y}."""
+		if isinstance(value, (list, tuple)) and len(value) == 2:
+			return {'coordinate_x': value[0], 'coordinate_y': value[1]}
+		if isinstance(value, str):
+			# Handle "x, y", "x,y", or "(x, y)" string formats produced by weaker LLMs
+			cleaned = value.strip().strip('()')
+			parts = [p.strip() for p in cleaned.split(',')]
+			if len(parts) == 2:
+				try:
+					return {'coordinate_x': int(float(parts[0])), 'coordinate_y': int(float(parts[1]))}
+				except (ValueError, TypeError):
+					pass
+		return value
+
+
 class InputTextAction(BaseModel):
-	index: int = Field(ge=0, description='from browser_state')
+	index: int | None = Field(default=None, ge=0, description='Element index from browser_state')
+	coordinate_x: int | None = Field(default=None, description='Horizontal coordinate relative to viewport left edge')
+	coordinate_y: int | None = Field(default=None, description='Vertical coordinate relative to viewport top edge')
 	text: str
 	clear: bool = Field(default=True, description='1=clear, 0=append')
 
+	@model_validator(mode='after')
+	def validate_target(self) -> 'InputTextAction':
+		if self.index is None and (self.coordinate_x is None or self.coordinate_y is None):
+			raise ValueError('Provide either index or both coordinate_x and coordinate_y')
+		return self
+
+
+class InputTextActionCoordinateOnly(BaseModel):
+	model_config = ConfigDict(title='InputTextAction')
+
+	coordinate_x: int = Field(description='Horizontal coordinate relative to viewport left edge')
+	coordinate_y: int = Field(description='Vertical coordinate relative to viewport top edge')
+	text: str
+	clear: bool = Field(default=True, description='1=clear, 0=append')
+
+	@model_validator(mode='before')
+	@classmethod
+	def coerce_list(cls, value: object) -> object:
+		"""Accept [x, y, text] or [x, y, text, clear] lists from weaker LLMs."""
+		if isinstance(value, (list, tuple)) and len(value) >= 3:
+			result: dict[str, object] = {'coordinate_x': value[0], 'coordinate_y': value[1], 'text': value[2]}
+			if len(value) >= 4:
+				result['clear'] = value[3]
+			return result
+		return value
+
 
 class DoneAction(BaseModel):
+	@model_validator(mode='before')
+	@classmethod
+	def coerce_string(cls, value: object) -> object:
+		"""Accept a plain string as {'text': string}."""
+		if isinstance(value, str):
+			return {'text': value}
+		return value
+
 	text: str = Field(
 		description=(
 			'Final message to the user. '
@@ -122,15 +190,53 @@ class StructuredOutputAction(BaseModel, Generic[T]):
 class SwitchTabAction(BaseModel):
 	tab_id: str = Field(min_length=4, max_length=4, description='4-char id')
 
+	@model_validator(mode='before')
+	@classmethod
+	def coerce_string(cls, v: object) -> object:
+		if isinstance(v, str):
+			return {'tab_id': v}
+		return v
+
 
 class CloseTabAction(BaseModel):
 	tab_id: str = Field(min_length=4, max_length=4, description='4-char id')
+
+	@model_validator(mode='before')
+	@classmethod
+	def coerce_string(cls, v: object) -> object:
+		if isinstance(v, str):
+			return {'tab_id': v}
+		return v
 
 
 class ScrollAction(BaseModel):
 	down: bool = Field(default=True, description='down=True=scroll down, down=False scroll up')
 	pages: float = Field(default=1.0, description='0.5=half page, 1=full page, 10=to bottom/top')
 	index: int | None = Field(default=None, description='Optional element index to scroll within specific element')
+
+
+class ScrollActionCoordinateOnly(BaseModel):
+	model_config = ConfigDict(title='ScrollAction')
+
+	down: bool = Field(default=True, description='down=True=scroll down, down=False scroll up')
+	pages: float = Field(default=1.0, description='0.5=half page, 1=full page, 10=to bottom/top')
+
+	@model_validator(mode='before')
+	@classmethod
+	def coerce_list(cls, value: object) -> object:
+		"""Accept [x, y] coordinate-scroll lists from weaker LLMs.
+
+		[x, y]: positive y → scroll down, negative y → scroll up.
+		pages is estimated from |y| (400 px ≈ 1 page).
+		"""
+		if isinstance(value, (list, tuple)) and len(value) == 2:
+			y = value[1]
+			try:
+				y_num = float(y)
+			except (TypeError, ValueError):
+				return value
+			return {'down': y_num >= 0, 'pages': max(0.5, abs(y_num) / 400)}
+		return value
 
 
 class SendKeysAction(BaseModel):

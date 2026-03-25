@@ -209,6 +209,10 @@ class SchemaOptimizer:
 		Create Gemini-optimized schema, preserving explicit `required` arrays so Gemini
 		respects mandatory fields defined by the caller.
 
+		Gemini's Schema model only supports a subset of OpenAPI 3.0 fields and uses extra='forbid',
+		so numeric/string validation constraints (minimum, maximum, exclusiveMinimum, pattern, etc.)
+		are stripped by _fix_gemini_schema after this step.
+
 		Args:
 			model: The Pydantic model to optimize
 
