@@ -143,6 +143,18 @@ class ActionModel(BaseModel):
 							return {action_key: base_dict}
 						except Exception:
 							pass
+						# Second try: map the string to the first str-typed field in the param model
+						# and merge extra keys. Handles flat formats like:
+						# {"input": "Jean", "coordinate_x": 764, "coordinate_y": 376}
+						# → {"input": {"text": "Jean", "coordinate_x": 764, "coordinate_y": 376}}
+						str_field = next(
+							(fname for fname, finfo in param_type.model_fields.items() if finfo.annotation is str),
+							None,
+						)
+						if str_field:
+							merged: dict[str, Any] = {str_field: action_value}
+							merged.update(extra)
+							return {action_key: merged}
 					# Fallback: keep string as-is, drop unrecognised extras
 					return {action_key: action_value}
 

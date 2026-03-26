@@ -1159,10 +1159,18 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 	async def _maybe_apply_vision_grounding(self, browser_state_summary: BrowserStateSummary) -> None:
 		if self.settings.use_vision_grounding == 'fallback':
 			self.tools.set_vision_grounding_mode(False)
+		elif self.settings.use_vision_grounding is True:
+			# Re-enable at the start of each step (may have been disabled in a prior step due to no screenshot or error)
+			self.tools.set_vision_grounding_mode(True)
 
 		if self.vision_grounding_service is None:
 			return
 		if not browser_state_summary.screenshot:
+			if self.settings.use_vision_grounding is True:
+				# No screenshot available — fall back to DOM-only tools for this step so the model
+				# can use element indices instead of coordinates it doesn't have.
+				self.tools.set_vision_grounding_mode(False)
+				self.logger.warning('Vision grounding: no screenshot available, using DOM-only tools for this step')
 			return
 
 		selector_map = browser_state_summary.dom_state.selector_map if browser_state_summary.dom_state else {}
@@ -1182,7 +1190,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				task_context=self.task,
 			)
 			if not grounding_result.elements:
-				self.logger.warning('Vision grounding returned no elements; keeping DOM-based context')
+				self.logger.warning('Vision grounding returned no elements; falling back to DOM-based context')
+				self.tools.set_vision_grounding_mode(False)
 				return
 
 			browser_state_summary.screenshot = await self.vision_grounding_service.create_grounded_screenshot(
@@ -1198,9 +1207,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				'Elements were grounded from the screenshot. The labels in the screenshot match the list below. '
 				'Use coordinate-based actions with the listed center coordinates. Do not rely on DOM indices for interaction in this step.'
 			)
-			self.logger.info(f'🧭 Vision grounding active with {len(grounding_result.elements)} elements')
+			self.logger.info(f'🧭 Vision grounding active with {len(w.elements)} elements')
 		except Exception as e:
-			if self.settings.use_vision_grounding == 'fallback':
+			if self.settings.use_vision_grounding in ('fallback', True):
 				self.tools.set_vision_grounding_mode(False)
 			self.logger.warning(f'Vision grounding failed; continuing with DOM-based context: {e}')
 

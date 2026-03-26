@@ -81,11 +81,27 @@ class ClickElementAction(BaseModel):
 	# expect_download: bool = Field(default=False, description='set True if expecting a download, False otherwise')  # moved to downloads_watchdog.py
 	# click_count: int = 1  # TODO
 
+	@model_validator(mode='before')
+	@classmethod
+	def coerce_int_to_index(cls, value: object) -> object:
+		"""Accept a plain integer as {index: int} for backward-compat with LLMs using the old schema."""
+		if isinstance(value, int):
+			return {'index': value}
+		return value
+
 
 class ClickElementActionIndexOnly(BaseModel):
 	model_config = ConfigDict(title='ClickElementAction')
 
 	index: int = Field(ge=1, description='Element index from browser_state')
+
+	@model_validator(mode='before')
+	@classmethod
+	def coerce_int_to_index(cls, value: object) -> object:
+		"""Accept a plain integer as {index: int} for backward-compat with LLMs using the old schema."""
+		if isinstance(value, int):
+			return {'index': value}
+		return value
 
 
 class ClickElementActionCoordinateOnly(BaseModel):
@@ -224,18 +240,27 @@ class ScrollActionCoordinateOnly(BaseModel):
 	@model_validator(mode='before')
 	@classmethod
 	def coerce_list(cls, value: object) -> object:
-		"""Accept [x, y] coordinate-scroll lists from weaker LLMs.
+		"""Accept coordinate-scroll lists from weaker LLMs.
 
 		[x, y]: positive y → scroll down, negative y → scroll up.
+		[x, y, direction]: direction string ('down'/'up') overrides sign of y.
 		pages is estimated from |y| (400 px ≈ 1 page).
 		"""
-		if isinstance(value, (list, tuple)) and len(value) == 2:
+		if isinstance(value, (list, tuple)) and len(value) >= 2:
 			y = value[1]
 			try:
 				y_num = float(y)
 			except (TypeError, ValueError):
 				return value
-			return {'down': y_num >= 0, 'pages': max(0.5, abs(y_num) / 400)}
+			scroll_down = y_num >= 0
+			# 3rd element may be a direction string e.g. 'down', 'up'
+			if len(value) >= 3:
+				direction = str(value[2]).strip().lower()
+				if direction == 'up':
+					scroll_down = False
+				elif direction == 'down':
+					scroll_down = True
+			return {'down': scroll_down, 'pages': max(0.5, abs(y_num) / 400)}
 		return value
 
 
