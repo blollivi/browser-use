@@ -84,9 +84,11 @@ class ClickElementAction(BaseModel):
 	@model_validator(mode='before')
 	@classmethod
 	def coerce_int_to_index(cls, value: object) -> object:
-		"""Accept a plain integer as {index: int} for backward-compat with LLMs using the old schema."""
+		"""Accept a plain integer as {index: int} or [x, y] list as coordinates for backward-compat with LLMs."""
 		if isinstance(value, int):
 			return {'index': value}
+		if isinstance(value, (list, tuple)) and len(value) == 2:
+			return {'coordinate_x': value[0], 'coordinate_y': value[1]}
 		return value
 
 

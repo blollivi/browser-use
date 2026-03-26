@@ -1207,7 +1207,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				'Elements were grounded from the screenshot. The labels in the screenshot match the list below. '
 				'Use coordinate-based actions with the listed center coordinates. Do not rely on DOM indices for interaction in this step.'
 			)
-			self.logger.info(f'🧭 Vision grounding active with {len(w.elements)} elements')
+			self.logger.info(f'🧭 Vision grounding active with {len(grounding_result.elements)} elements')
 		except Exception as e:
 			if self.settings.use_vision_grounding in ('fallback', True):
 				self.tools.set_vision_grounding_mode(False)

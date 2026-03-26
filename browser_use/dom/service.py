@@ -363,12 +363,16 @@ class DomService:
 			)
 			ax_tree_requests.append(ax_tree_request)
 
-		# Wait for all requests to complete
-		ax_trees = await asyncio.gather(*ax_tree_requests)
+		# Wait for all requests to complete; frames can disappear mid-flight (e.g. after
+		# cookie-banner dismiss triggers navigation), so tolerate per-frame errors.
+		ax_trees = await asyncio.gather(*ax_tree_requests, return_exceptions=True)
 
-		# Merge all AX nodes into a single array
+		# Merge all AX nodes into a single array, skipping stale / disappeared frames
 		merged_nodes: list[AXNode] = []
 		for ax_tree in ax_trees:
+			if isinstance(ax_tree, BaseException):
+				self.logger.debug(f'Skipping stale frame in AX tree gather: {ax_tree}')
+				continue
 			merged_nodes.extend(ax_tree['nodes'])
 
 		return {'nodes': merged_nodes}
