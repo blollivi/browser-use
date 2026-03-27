@@ -84,11 +84,9 @@ class ClickElementAction(BaseModel):
 	@model_validator(mode='before')
 	@classmethod
 	def coerce_int_to_index(cls, value: object) -> object:
-		"""Accept a plain integer as {index: int} or [x, y] list as coordinates for backward-compat with LLMs."""
+		"""Accept a plain integer as {index: int} for backward-compat with LLMs using the old schema."""
 		if isinstance(value, int):
 			return {'index': value}
-		if isinstance(value, (list, tuple)) and len(value) == 2:
-			return {'coordinate_x': value[0], 'coordinate_y': value[1]}
 		return value
 
 
@@ -136,6 +134,25 @@ class InputTextAction(BaseModel):
 	coordinate_y: int | None = Field(default=None, description='Vertical coordinate relative to viewport top edge')
 	text: str
 	clear: bool = Field(default=True, description='1=clear, 0=append')
+
+	@model_validator(mode='before')
+	@classmethod
+	def coerce_list(cls, value: object) -> object:
+		"""Accept [index, text], [index, text, clear], [x, y, text], or [x, y, text, clear] lists from weaker LLMs."""
+		if isinstance(value, (list, tuple)):
+			if len(value) == 2:
+				# [index, text]
+				return {'index': value[0], 'text': value[1]}
+			elif len(value) == 3:
+				# [index, text, clear] if second element is a string, else [x, y, text]
+				if isinstance(value[1], str):
+					return {'index': value[0], 'text': value[1], 'clear': value[2]}
+				else:
+					return {'coordinate_x': value[0], 'coordinate_y': value[1], 'text': value[2]}
+			elif len(value) >= 4:
+				# [x, y, text, clear]
+				return {'coordinate_x': value[0], 'coordinate_y': value[1], 'text': value[2], 'clear': value[3]}
+		return value
 
 	@model_validator(mode='after')
 	def validate_target(self) -> 'InputTextAction':
@@ -242,27 +259,18 @@ class ScrollActionCoordinateOnly(BaseModel):
 	@model_validator(mode='before')
 	@classmethod
 	def coerce_list(cls, value: object) -> object:
-		"""Accept coordinate-scroll lists from weaker LLMs.
+		"""Accept [x, y] coordinate-scroll lists from weaker LLMs.
 
 		[x, y]: positive y → scroll down, negative y → scroll up.
-		[x, y, direction]: direction string ('down'/'up') overrides sign of y.
 		pages is estimated from |y| (400 px ≈ 1 page).
 		"""
-		if isinstance(value, (list, tuple)) and len(value) >= 2:
+		if isinstance(value, (list, tuple)) and len(value) == 2:
 			y = value[1]
 			try:
 				y_num = float(y)
 			except (TypeError, ValueError):
 				return value
-			scroll_down = y_num >= 0
-			# 3rd element may be a direction string e.g. 'down', 'up'
-			if len(value) >= 3:
-				direction = str(value[2]).strip().lower()
-				if direction == 'up':
-					scroll_down = False
-				elif direction == 'down':
-					scroll_down = True
-			return {'down': scroll_down, 'pages': max(0.5, abs(y_num) / 400)}
+			return {'down': y_num >= 0, 'pages': max(0.5, abs(y_num) / 400)}
 		return value
 
 

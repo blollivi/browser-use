@@ -14,6 +14,7 @@ class SchemaOptimizer:
 		*,
 		remove_min_items: bool = False,
 		remove_defaults: bool = False,
+		strict_mode: bool = True,
 	) -> dict[str, Any]:
 		"""
 		Create the most optimized schema by flattening all $ref/$defs while preserving
@@ -157,7 +158,8 @@ class SchemaOptimizer:
 						ensure_additional_properties_false(item)
 
 		ensure_additional_properties_false(optimized_schema)
-		SchemaOptimizer._make_strict_compatible(optimized_schema)
+		if strict_mode:
+			SchemaOptimizer._make_strict_compatible(optimized_schema)
 
 		# Final pass to remove minItems/min_items and default values if requested
 		if remove_min_items or remove_defaults:
@@ -209,9 +211,11 @@ class SchemaOptimizer:
 		Create Gemini-optimized schema, preserving explicit `required` arrays so Gemini
 		respects mandatory fields defined by the caller.
 
-		Gemini's Schema model only supports a subset of OpenAPI 3.0 fields and uses extra='forbid',
-		so numeric/string validation constraints (minimum, maximum, exclusiveMinimum, pattern, etc.)
-		are stripped by _fix_gemini_schema after this step.
+		Gemini uses OpenAPI 3.0 subset — it does NOT use OpenAI strict mode semantics.
+		_make_strict_compatible is intentionally skipped here: it would mark all fields
+		(including optional ones) as required, which breaks Gemini's schema validator when
+		fields with anyOf / nullable types appear in the required array.
+		_fix_gemini_schema handles the remaining cleanup (unsupported keys, nullable conversion).
 
 		Args:
 			model: The Pydantic model to optimize
@@ -219,4 +223,4 @@ class SchemaOptimizer:
 		Returns:
 			Optimized schema suitable for Gemini structured output
 		"""
-		return SchemaOptimizer.create_optimized_json_schema(model)
+		return SchemaOptimizer.create_optimized_json_schema(model, strict_mode=False)

@@ -158,6 +158,25 @@ class ActionModel(BaseModel):
 					# Fallback: keep string as-is, drop unrecognised extras
 					return {action_key: action_value}
 
+		# --- Pass 3: handle plain string/scalar action value that should be wrapped in params ---
+		# e.g. {"wait": "3"} → {"wait": {"seconds": "3"}} so Pydantic coerces "3" → int 3
+		# This handles LLMs that emit a bare scalar instead of a nested params dict.
+		# Lists/tuples are excluded: param models like InputTextAction have their own coerce_list
+		# validators that handle e.g. {"input": ["28727", "text"]} → {"index": 28727, "text": "text"}.
+		if valid_fields and not leaked:
+			action_keys = [k for k in v if k in valid_fields]
+			extra_keys = [k for k in v if k not in valid_fields]
+			if len(action_keys) == 1 and not extra_keys:
+				action_key = action_keys[0]
+				action_value = v[action_key]
+				if not isinstance(action_value, (dict, BaseModel, list, tuple)) and action_value is not None:
+					field_info = cls.model_fields.get(action_key)
+					param_type = field_info.annotation if field_info else None
+					if param_type is not None and isinstance(param_type, type) and issubclass(param_type, BaseModel):
+						param_fields = list(param_type.model_fields.keys())
+						if param_fields:
+							return {action_key: {param_fields[0]: action_value}}
+
 		return v
 
 	def get_index(self) -> int | None:

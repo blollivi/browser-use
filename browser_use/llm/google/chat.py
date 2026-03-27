@@ -565,6 +565,9 @@ class ChatGoogle(BaseChatModel):
 		# Gemini's Schema model only supports a subset of OpenAPI 3.0 fields and uses extra='forbid',
 		# so any JSON Schema keywords it doesn't recognize (like exclusiveMinimum/Maximum, numeric
 		# constraints, pattern, etc.) must be stripped before passing to the API.
+		# NOTE: 'anyOf' is intentionally NOT in this list — Gemini 2.0+ supports it natively and
+		# it is required to express the action union (list[ActionModel]) correctly. Removing it
+		# makes the schema unconstrained and causes the model to emit malformed action values.
 		_GEMINI_UNSUPPORTED_KEYS = frozenset([
 			'additionalProperties',
 			'default',
@@ -578,7 +581,6 @@ class ChatGoogle(BaseChatModel):
 			'pattern',
 			'const',
 			'allOf',
-			'anyOf',
 			'oneOf',
 			'not',
 			'if',
@@ -588,13 +590,31 @@ class ChatGoogle(BaseChatModel):
 
 		def clean_schema(obj: Any, parent_key: str | None = None) -> Any:
 			if isinstance(obj, dict):
+				# Convert JSON Schema `anyOf: [{type: T}, {type: null}]` patterns to
+				# OpenAPI 3.0 `{..T.., nullable: true}` which Gemini understands.
+				# This handles Python `Optional[X]` fields (str | None, int | None, etc.).
+				if 'anyOf' in obj and isinstance(obj.get('anyOf'), list):
+					branches = obj['anyOf']
+					null_branches = [b for b in branches if b == {'type': 'null'} or b.get('type') == 'null']
+					non_null_branches = [b for b in branches if b != {'type': 'null'} and b.get('type') != 'null']
+					if null_branches and len(non_null_branches) == 1:
+						# Optional[T] pattern: absorb the non-null branch, add nullable: true
+						merged = {k: v for k, v in obj.items() if k != 'anyOf'}
+						merged.update(non_null_branches[0])
+						merged['nullable'] = True
+						return clean_schema(merged, parent_key=parent_key)
+
 				# Remove unsupported properties
 				cleaned = {}
 				for key, value in obj.items():
 					# Only strip 'title' when it's a JSON Schema metadata field (not inside 'properties')
 					# 'title' as a metadata field appears at schema level, not as a property name
 					is_metadata_title = key == 'title' and parent_key != 'properties'
-					if key not in _GEMINI_UNSUPPORTED_KEYS and not is_metadata_title:
+					# Only strip unsupported JSON Schema keywords at schema-keyword level,
+					# NOT when parent is 'properties' (where keys are field names, not keywords).
+					# e.g. a field named 'pattern' must not be stripped from a properties dict.
+					is_schema_keyword = key in _GEMINI_UNSUPPORTED_KEYS and parent_key != 'properties'
+					if not is_schema_keyword and not is_metadata_title:
 						cleaned_value = clean_schema(value, parent_key=key)
 						# Handle empty object properties - Gemini doesn't allow empty OBJECT types
 						if (
